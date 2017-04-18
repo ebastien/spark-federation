@@ -16,6 +16,13 @@ import org.apache.spark.sql.execution.{RDDConversions, RowDataSourceScanExec, Sp
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.catalyst.plans._
 
+import org.http4s.{Uri, Method, Request, GenericCredentials, Headers, Header}
+import org.http4s.client.blaze.PooledHttp1Client
+import org.http4s.circe.jsonOf
+import io.circe.generic.auto._
+
+import scalaz.concurrent.Task
+
 /**
   * A partition for our federated RDD
   *
@@ -35,16 +42,50 @@ class FederatedRDD(
   val params: String
 )(@transient val sc: SparkContext) extends RDD[Row](sc, Nil) {
 
+  // There is only one (dummy) partition
   val partition = FederatedPartition(0)
 
+  // The HTTP client is instantiated upon request from the executor
+  lazy val client = PooledHttp1Client()
+
+  // Geonames API parameters
+  val geonamesUser = "demo"
+  val geonamesICAO = "LSZH"
+
+  // The representation of weather information as case classes
+  case class WeatherObservation(
+    humidity: Int,
+    elevation: Long
+  )
+  case class Representation(weatherObservation: WeatherObservation)
+
+  // Compile a task for fetching weather information from Geonames
+  def task: Task[Representation] = {
+    // TODO: Make use of the RDD parameters somehow
+    val req = Request(
+      Method.GET,
+      Uri.uri("http://api.geonames.org")
+         .withPath("/weatherIcaoJSON")
+         .withQueryParam("ICAO", geonamesICAO)
+         .withQueryParam("username", geonamesUser)
+    )
+    client.expect(req)(jsonOf[Representation])
+  }
+
+  // Compute a partition from within a task on a executor
   override def compute(
     split: Partition,
     context: TaskContext
   ): Iterator[Row] = {
-    // Where we should actually go fetch the rows...
-    // ...instead the result is hardcoded to match the SQL statement.
-    println(params)
-    Iterator(Row(42, 12L))
+    // Would the HTTP task fail an exception is thrown
+    val rep = task.unsafePerformSyncFor(5000)
+    // Generate a rows iterator from the weather information
+    Iterator(
+      Row(
+        rep.weatherObservation.humidity,
+        rep.weatherObservation.elevation
+      )
+    )
   }
 
   override def getPartitions: Array[Partition] = Array(partition)
